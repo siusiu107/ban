@@ -1,8 +1,9 @@
 {
-  "name": "siu-ban-endpoint",
+  "name": "ban",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
   "dependencies": {
-    "firebase-admin": "^12.5.0"
+    "firebase-admin": "^12.6.0"
   }
 }
