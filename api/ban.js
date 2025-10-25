@@ -1,70 +1,84 @@
-const admin = require('firebase-admin');
+// Vercel Serverless Function: POST /api/ban
+// Body: { idToken: string, reason?: string, suspicion?: number }
 
-function getEnv(name, fallback = '') {
-  const v = process.env[name];
-  return v && v.trim() ? v : fallback;
-}
+const admin = require("firebase-admin");
 
-const sa = getEnv('FIREBASE_SERVICE_ACCOUNT'); // 서비스계정 JSON 문자열(필수)
-const rtdbUrl = getEnv('FIREBASE_RTDB_URL');   // 선택
-const allowed = (getEnv('ALLOWED_ORIGINS') || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+function initAdmin() {
+  if (admin.apps.length) return admin;
 
-if (!admin.apps.length) {
+  const projectId   = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  // 줄바꿈이 \n 문자로 저장된 경우를 모두 실제 개행으로 치환
+  const privateKeyRaw = process.env.FIREBASE_PRIVATE_KEY || "";
+  const privateKey = privateKeyRaw.includes("\\n")
+    ? privateKeyRaw.replace(/\\n/g, "\n")
+    : privateKeyRaw;
+
   admin.initializeApp({
-    credential: admin.credential.cert(JSON.parse(sa || '{}')),
-    databaseURL: rtdbUrl || undefined,
+    credential: admin.credential.cert({ projectId, clientEmail, privateKey }),
+    databaseURL: process.env.FIREBASE_DATABASE_URL
   });
+  return admin;
 }
 
-function isOriginAllowed(origin) {
-  if (!allowed.length) return true;       // 환경변수 안 넣으면 전체 허용(간편)
-  try {
-    const u = new URL(origin);
-    const full = `${u.protocol}//${u.host}`;
-    return allowed.includes(full);
-  } catch { return false; }
+function allowCors(req, res) {
+  const allow = (process.env.CORS_ALLOW_ORIGIN || "*")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const origin = req.headers.origin || "";
+  const ok =
+    allow.includes("*") ||
+    allow.includes(origin) ||
+    allow.some(a => a && origin.endsWith(a.replace(/^\*?https?:\/\//, "")));
+
+  if (ok && origin) res.setHeader("Access-Control-Allow-Origin", origin);
+  else if (allow.includes("*")) res.setHeader("Access-Control-Allow-Origin", "*");
+
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
-module.exports = async (req, res) => {
-  // CORS preflight
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    return res.status(200).end();
-  }
-
-  if (!isOriginAllowed(req.headers.origin)) {
-    return res.status(403).json({ error: 'forbidden-origin' });
-  }
-  res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.setHeader('Vary', 'Origin');
-
-  if (req.method !== 'POST') return res.status(405).json({ error: 'method-not-allowed' });
+module.exports = async function handler(req, res) {
+  allowCors(req, res);
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
 
   try {
-    const { idToken, reason, suspicion } = (req.body || {});
-    if (!idToken) return res.status(400).json({ error: 'missing-idToken' });
+    const { idToken, reason = "auto-ban", suspicion = null } = req.body || {};
+    if (!idToken) return res.status(400).json({ error: "Missing idToken" });
 
-    const decoded = await admin.auth().verifyIdToken(String(idToken), true);
+    const app = initAdmin();
+
+    // 1) 토큰 검증
+    let decoded;
+    try {
+      decoded = await app.auth().verifyIdToken(idToken, true);
+    } catch (e) {
+      return res.status(401).json({ error: "Invalid idToken" });
+    }
+
     const uid = decoded.uid;
 
-    await admin.auth().updateUser(uid, { disabled: true });
-    await admin.auth().revokeRefreshTokens(uid);
+    // 2) 계정 정지
+    await app.auth().updateUser(uid, { disabled: true });
 
+    // 3) (선택) RTDB에 로그 남기기
     try {
-      await admin.database().ref(`bans/${uid}`).set({
-        disabled: true,
-        by: 'auto-ban',
-        reason: reason || 'auto-ban',
-        suspicion: suspicion ?? null,
-        at: Date.now()
+      const ts = Date.now();
+      await app.database().ref(`banLogs/${uid}/${ts}`).set({
+        reason,
+        suspicion,
+        by: "vercel-api",
+        at: ts
       });
     } catch {}
 
-    return res.status(200).json({ ok: true });
-  } catch (e) {
-    return res.status(500).json({ error: e?.message || 'ban-failed' });
+    return res.status(200).json({ ok: true, uid, disabled: true });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Server error" });
   }
 };
